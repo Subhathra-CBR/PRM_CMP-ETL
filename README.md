@@ -2,11 +2,11 @@ This ETL pipeline extracts incremental participant and visit data from the PRM P
 
 The pipeline supports:
 
-Incremental data loading using watermark control
-Participant synchronization
-Visit synchronization
-Upsert logic using PostgreSQL ON CONFLICT
-Environment variable-based configuration
+Incremental data loading using watermark control,
+Participant synchronization,
+Visit synchronization,
+Upsert logic using PostgreSQL ON CONFLICT,
+Environment variable-based configuration and
 Data migration between PRM and CMP systems
 
 The ETL pipeline:
