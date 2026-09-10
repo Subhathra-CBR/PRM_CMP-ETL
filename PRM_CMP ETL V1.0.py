@@ -2,7 +2,7 @@ import psycopg2
 import json
 import os
 
-from datetime import datetime
+from datetime import datetime, time
 from dotenv import load_dotenv
 
 # --------------------------------------------------
@@ -75,6 +75,61 @@ def get_watermark(cmp_conn, pipeline_name):
         return row[0]
 
     return datetime(1970, 1, 1)
+
+# --------------------------------------------------
+# BVA HELPERS
+# --------------------------------------------------
+
+def map_assessment_type(code):
+
+    if not code:
+        return None
+
+    mapping = {
+        "FUNDUS": "FND",
+        "SPIRO": "SPR",
+        "REFRAC": "RFM",
+        "GAIT": "GAI",
+        "BALANCE": "BAL",
+        "DOPPLER": "CAD",
+        "BLOOD": "BBC",
+        "NURSING_ODK": "NODK",
+        "ODK": "CLN",
+        "AUDIOMETRY": "AUD",
+        "AUDIOMETRY_SCREENING": "AUDSCRN"
+    }
+
+    return mapping.get(
+        str(code).upper(),
+        str(code).upper()
+    )
+
+
+def map_site_id(visit_mode):
+
+    site_mapping = {
+        "CBR": 10101,
+        "SRINIVASPURA": 10101,
+        "IISC": 10102,
+        "MOBILE UNIT": 10103
+    }
+
+    if not visit_mode:
+        return 10101
+
+    return site_mapping.get(
+        str(visit_mode).upper(),
+        10101
+    )
+
+
+def map_status(is_done):
+
+    return (
+        "CONFIRMED"
+        if is_done
+        else "CANCELLED"
+    )
 
 
 def update_watermark(
@@ -342,6 +397,195 @@ def sync_visits(prm_conn, cmp_conn):
     )
 
 # --------------------------------------------------
+# BVA ETL
+# --------------------------------------------------
+
+def extract_bva_delta(prm_conn, watermark):
+
+    query = """
+    SELECT
+        pa.id,
+        pa.visit_id,
+        ai.code,
+        pa.is_done,
+        pa.done_date,
+        pa.created_at,
+        pa.updated_at,
+        pa.scheduled_date,
+        pa.scheduled_time,
+        pa.visit_mode
+    FROM participant_assessments pa
+    INNER JOIN assessment_items ai
+        ON ai.id = pa.item_id
+    WHERE pa.updated_at > %s
+      AND ai.is_active = TRUE
+    ORDER BY pa.updated_at
+    """
+
+    cur = prm_conn.cursor()
+
+    cur.execute(query, (watermark,))
+
+    return cur.fetchall()
+
+
+def load_bva_cmp(cmp_conn, rows):
+
+    upsert_sql = """
+    INSERT INTO cohort_101.visit_details
+    (
+        id,
+        visit_occurrence_id,
+        site_id,
+        facilitator_id,
+        assesment_type,
+        started_at,
+        ended_at,
+        slot,
+        status,
+        source,
+        source_updated_at,
+        is_deleted,
+        created_at,
+        created_by,
+        updated_at,
+        updated_by
+    )
+    VALUES
+    (
+        %s,%s,%s,%s,%s,%s,%s,%s,
+        %s,%s,%s,%s,%s,%s,%s,%s
+    )
+
+    ON CONFLICT (id)
+    DO UPDATE SET
+        visit_occurrence_id = EXCLUDED.visit_occurrence_id,
+        site_id             = EXCLUDED.site_id,
+        assesment_type      = EXCLUDED.assesment_type,
+        started_at          = EXCLUDED.started_at,
+        ended_at            = EXCLUDED.ended_at,
+        status              = EXCLUDED.status,
+        updated_at          = EXCLUDED.updated_at
+    """
+
+    cur = cmp_conn.cursor()
+
+    latest_timestamp = None
+
+    for row in rows:
+
+        (
+            pa_id,
+            visit_id,
+            assessment_code,
+            is_done,
+            done_date,
+            created_at,
+            updated_at,
+            scheduled_date,
+            scheduled_time,
+            visit_mode
+        ) = row
+
+        assessment_type = map_assessment_type(
+            assessment_code
+        )
+
+        site_id = map_site_id(
+            visit_mode
+        )
+
+        status = map_status(
+            is_done
+        )
+
+        started_at = None
+
+        if scheduled_date and scheduled_time:
+            started_at = datetime.combine(
+                scheduled_date,
+                scheduled_time
+            )
+
+        ended_at = '2026-07-30T12:06:49' #None
+
+        if done_date:
+            ended_at = datetime.combine(
+                done_date,
+                scheduled_time
+                if scheduled_time
+                else time.min
+            )
+
+        insert_row = (
+            pa_id,
+            visit_id,
+            site_id,
+            None,
+            assessment_type,
+            started_at,
+            ended_at,
+            None,
+            status,
+            "PRM_ETL",
+            updated_at,
+            False,
+            created_at,
+            None,
+            updated_at,
+            None
+        )
+
+        cur.execute(
+            upsert_sql,
+            insert_row
+        )
+
+        latest_timestamp = updated_at
+
+    cmp_conn.commit()
+
+    return latest_timestamp
+
+
+def sync_bva(prm_conn, cmp_conn):
+
+    watermark = get_watermark(
+        cmp_conn,
+        "prm_cmp_bva_sync"
+    )
+
+    rows = extract_bva_delta(
+        prm_conn,
+        watermark
+    )
+
+    if not rows:
+
+        print(
+            "No BVA changes found"
+        )
+
+        return
+
+    latest_timestamp = load_bva_cmp(
+        cmp_conn,
+        rows
+    )
+
+    update_watermark(
+        cmp_conn,
+        "prm_cmp_bva_sync",
+        latest_timestamp,
+        len(rows)
+    )
+
+    print(
+        f"{len(rows)} BVA rows processed"
+    )
+    
+
+# --------------------------------------------------
 # MAIN ETL
 # --------------------------------------------------
 
@@ -360,6 +604,11 @@ def run_etl():
         sync_visits(
             prm_conn,
             cmp_conn
+        )
+
+        sync_bva(
+            prm_conn,
+             cmp_conn
         )
 
         print("ETL completed successfully")
